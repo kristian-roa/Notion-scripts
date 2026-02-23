@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
+from datetime import date
 
 load_dotenv()
 
@@ -44,6 +45,50 @@ PRIORITY_MAP = {
     "P: Høy": "Alvorlig",
     "P: Haster": "Kritisk",
 }
+
+CUTOFF = date.fromisoformat("2026-01-01")
+
+def _parse_iso_date_start(value: str | None) -> Optional[date]:
+    """
+    Accepts:
+      'YYYY-MM-DD'
+      'YYYY-MM-DD..YYYY-MM-DD'
+      'YYYY-MM-DDTHH:MM:SS...'  (we take the date part)
+    Returns a date or None.
+    """
+    if not value:
+        return None
+    s = value.strip()
+    if not s:
+        return None
+
+    # handle ranges "start..end"
+    if ".." in s:
+        s = s.split("..", 1)[0].strip()
+
+    # handle timestamps
+    s = s[:10]
+
+    try:
+        return date.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def filter_tasks(tasks: list[dict]) -> list[dict]:
+    out = []
+    for t in tasks:
+        status = (t.get("Status") or "").strip()
+        if status.lower() != "archived":
+            out.append(t)
+            continue
+
+        # Archived: only include if Arkiveringsdato > 2026-01-01
+        ark = _parse_iso_date_start(t.get("Arkiveringsdato"))
+        if ark and ark > CUTOFF:
+            out.append(t)
+
+    return out
 
 
 # ----------------------------
@@ -406,9 +451,12 @@ def migrate_tasks(tasks: list[dict], *, dry_run: bool = False) -> list[str]:
 
 
 if __name__ == "__main__":
-    # Load from a file if you want:
-    with open("tasks_notion_small.json", "r", encoding="utf-8") as f:
-        tasks = json.load(f)
+    if __name__ == "__main__":
+        with open("tasks_notion_small.json", "r", encoding="utf-8") as f:
+            tasks = json.load(f)
 
-    created = migrate_tasks(tasks, dry_run=False)  # set dry_run=True to test
-    print("\nCreated:", created)
+        tasks = filter_tasks(tasks)
+        print(f"After filter: {len(tasks)} tasks")
+
+        created = migrate_tasks(tasks, dry_run=False)
+        print("\nCreated:", created)
