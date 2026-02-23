@@ -13,7 +13,7 @@ load_dotenv()
 # ----------------------------
 # Config (set env vars)
 # ----------------------------
-JIRA_BASE_URL = os.environ["JIRA_BASE_URL"]
+JIRA_BASE_URL = os.environ["JIRA_BASE_URL"].rstrip("/")
 JIRA_EMAIL = os.environ["JIRA_EMAIL"]
 JIRA_API_TOKEN = os.environ["JIRA_API_TOKEN"]
 JIRA_PROJECT_KEY = os.environ["JIRA_PROJECT_KEY"]
@@ -30,6 +30,20 @@ STATUS_ID_DONE = "13382"
 
 auth = HTTPBasicAuth(JIRA_EMAIL, JIRA_API_TOKEN)
 headers = {"Accept": "application/json", "Content-Type": "application/json"}
+
+# ----------------------------
+# Requested constants
+# ----------------------------
+CONST_OPPGAVEKATEGORI = "Markedsinitiativ"
+CONST_CATEGORY_OF_WORK = "Strategic intent"
+
+# Priority mapping you provided (Notion -> Jira priority name)
+PRIORITY_MAP = {
+    "P: Lav": "Uviktig",
+    "P: Medium": "Mindre alvorlig",
+    "P: Høy": "Alvorlig",
+    "P: Haster": "Kritisk",
+}
 
 
 # ----------------------------
@@ -50,11 +64,15 @@ def adf_doc(text: str) -> dict:
     return {"type": "doc", "version": 1, "content": paragraphs or [{"type": "paragraph", "content": []}]}
 
 
-def jira_request(method: str, path: str, *, json_body: Any | None = None,
-                 params: dict | None = None) -> requests.Response:
+def jira_request(
+        method: str,
+        path: str,
+        *,
+        json_body: Any | None = None,
+        params: dict | None = None
+) -> requests.Response:
     url = f"{JIRA_BASE_URL}{path}"
-    r = requests.request(method, url, auth=auth, headers=headers, json=json_body, params=params, timeout=30)
-    return r
+    return requests.request(method, url, auth=auth, headers=headers, json=json_body, params=params, timeout=30)
 
 
 def create_issue(payload: dict) -> dict:
@@ -98,8 +116,10 @@ def transition_to_status_id(issue_key: str, target_status_id: str) -> None:
     transitions = get_transitions(issue_key)
     match = next((t for t in transitions if t.get("to", {}).get("id") == target_status_id), None)
     if not match:
-        available = [(t.get("id"), t.get("name"), t.get("to", {}).get("name"), t.get("to", {}).get("id")) for t in
-                     transitions]
+        available = [
+            (t.get("id"), t.get("name"), t.get("to", {}).get("name"), t.get("to", {}).get("id"))
+            for t in transitions
+        ]
         raise RuntimeError(f"No transition from {issue_key} to status id {target_status_id}. Available: {available}")
 
     r = jira_request("POST", f"/rest/api/3/issue/{issue_key}/transitions",
@@ -115,28 +135,31 @@ def add_comment(issue_key: str, comment_text: str) -> None:
         raise RuntimeError(f"Add comment failed {r.status_code}: {r.text}")
 
 
-def find_account_id(display_name: str) -> Optional[str]:
-    """
-    Finds a user by displayName-ish query. You may want to tighten matching if ambiguous.
-    """
-    r = jira_request("GET", "/rest/api/3/user/search", params={"query": display_name, "maxResults": 10})
-    if r.status_code >= 400:
-        raise RuntimeError(f"User search failed {r.status_code}: {r.text}")
-
-    users = r.json()
-    # Try exact displayName match first
-    for u in users:
-        if (u.get("displayName") or "").strip().lower() == display_name.strip().lower():
-            return u.get("accountId")
-    # Fall back to first result if any
-    return users[0].get("accountId") if users else None
-
-
 def get_priorities() -> list[dict]:
     r = jira_request("GET", "/rest/api/3/priority")
     if r.status_code >= 400:
         raise RuntimeError(f"Get priorities failed {r.status_code}: {r.text}")
     return r.json()
+
+
+def get_fields() -> list[dict]:
+    r = jira_request("GET", "/rest/api/3/field")
+    if r.status_code >= 400:
+        raise RuntimeError(f"Get fields failed {r.status_code}: {r.text}")
+    return r.json()
+
+
+def resolve_field_ids(field_names: list[str]) -> dict[str, str]:
+    """
+    Jira Cloud requires custom fields to be referenced by id (customfield_XXXXX).
+    We resolve the IDs from /rest/api/3/field.
+    """
+    all_fields = get_fields()
+    by_name = {f.get("name"): f.get("id") for f in all_fields if f.get("name") and f.get("id")}
+    missing = [n for n in field_names if n not in by_name]
+    if missing:
+        raise RuntimeError(f"Could not resolve Jira field IDs for: {missing}")
+    return {n: by_name[n] for n in field_names}
 
 
 def set_issue_fields(issue_key: str, fields: dict) -> None:
@@ -162,6 +185,18 @@ def parse_tags(tags: str | None) -> list[str]:
     return [normalize_label(p) for p in parts]
 
 
+def merge_labels(*label_lists: list[str]) -> list[str]:
+    """Merge multiple label lists, de-dupe while preserving order."""
+    out: list[str] = []
+    seen = set()
+    for lst in label_lists:
+        for x in lst:
+            if x and x not in seen:
+                seen.add(x)
+                out.append(x)
+    return out
+
+
 def parse_estimate_to_jira(original: str | None) -> Optional[str]:
     """
     Your format: 'S: Liten (4t)' -> '4h'
@@ -175,14 +210,16 @@ def parse_estimate_to_jira(original: str | None) -> Optional[str]:
     return f"{hours}h"
 
 
+# ----------------------------
+# Task mapping
+# ----------------------------
 @dataclass
 class TaskMappingResult:
     summary: str
     description: str
     labels: list[str]
-    priority_name: Optional[str]
+    priority_id: Optional[str]
     original_estimate: Optional[str]
-    # assignee_account_id: Optional[str]
     target_status_id: Optional[str]
     comments: list[str]
 
@@ -193,17 +230,9 @@ class TaskMapper:
     """
 
     def __init__(self):
-        # You can tune these to your Jira priority names.
-        # We'll map your string to a *priority name* found in /rest/api/3/priority.
-        self.priority_map = {
-            "p: høy": ["Høy", "High", "Highest"],
-            "p: middels": ["Medium", "Middels"],
-            "p: lav": ["Lav", "Low", "Lowest"],
-        }
-
         # Map external status to target status id on the board
         self.status_map = {
-            "archived": STATUS_ID_DONE,  # archived work -> Done
+            "archived": STATUS_ID_DONE,
             "done": STATUS_ID_DONE,
             "qa": STATUS_ID_QA,
             "in progress": STATUS_ID_INPROGRESS,
@@ -215,18 +244,13 @@ class TaskMapper:
         if not src:
             return None
 
-        key = src.strip().lower()
-        candidate_names = self.priority_map.get(key)
-        if not candidate_names:
-            # If it doesn't match known pattern, try using it directly
-            candidate_names = [src]
+        mapped_name = PRIORITY_MAP.get(src.strip(), src.strip())
 
-        jira_names = {p.get("name") for p in jira_priorities}
-        for name in candidate_names:
-            if name in jira_names:
-                return name
+        for p in jira_priorities:
+            if (p.get("name") or "").strip().lower() == mapped_name.lower():
+                return p.get("id")
 
-        # No match — return None; we’ll skip setting priority rather than fail the migration
+        print(f"WARN: No Jira priority match for '{mapped_name}'")
         return None
 
     def map_status_id(self, src: str | None) -> Optional[str]:
@@ -237,9 +261,7 @@ class TaskMapper:
     def map_comments(self, src: str | None) -> list[str]:
         if not src:
             return []
-        # Your example: multiple lines "timestamp: text"
-        lines = [l.strip() for l in src.splitlines() if l.strip()]
-        return lines
+        return [l.strip() for l in src.splitlines() if l.strip()]
 
     def map_task(self, task: dict, jira_priorities: list[dict]) -> TaskMappingResult:
         summary = (task.get("Title") or "").strip()
@@ -248,13 +270,15 @@ class TaskMapper:
 
         description = (task.get("Description") or "").strip()
 
-        labels = parse_tags(task.get("Tags"))
+        # Tags + Codebase should both become labels
+        tags_labels = parse_tags(task.get("Tags"))
+        codebase_src = task.get("Labels") or task.get("Kodebase / type")
+        codebase_labels = parse_tags(codebase_src)
 
-        priority_name = self.map_priority(task.get("Prioritet"), jira_priorities)
+        labels = merge_labels(tags_labels, codebase_labels)
+
+        priority_id = self.map_priority(task.get("Prioritet"), jira_priorities)
         original_estimate = parse_estimate_to_jira(task.get("Estimater"))
-
-        assignee_name = (task.get("Tilordnet") or "").strip()
-        assignee_account_id = find_account_id(assignee_name) if assignee_name else None
 
         target_status_id = self.map_status_id(task.get("Status"))
         comments = self.map_comments(task.get("Comments"))
@@ -263,35 +287,33 @@ class TaskMapper:
             summary=summary,
             description=description,
             labels=labels,
-            priority_name=priority_name,
+            priority_id=priority_id,
             original_estimate=original_estimate,
-            # assignee_account_id=assignee_account_id,
             target_status_id=target_status_id,
             comments=comments,
         )
 
 
 # ----------------------------
-# Migration
+# Payload build (Option B)
+# Create first WITHOUT custom fields,
+# then update fields afterwards.
 # ----------------------------
 def build_create_payload(mapped: TaskMappingResult) -> dict:
     fields: dict[str, Any] = {
         "project": {"key": JIRA_PROJECT_KEY},
         "summary": mapped.summary,
-        # Your issue type name is Norwegian in the example: "Oppgave"
-        # If "Task" doesn't exist in this project, use "Oppgave"
         "issuetype": {"name": "Oppgave"},
     }
 
-    # Description must be ADF on create
     if mapped.description:
         fields["description"] = adf_doc(mapped.description)
 
     if mapped.labels:
         fields["labels"] = mapped.labels
 
-    if mapped.priority_name:
-        fields["priority"] = {"name": mapped.priority_name}
+    if mapped.priority_id:
+        fields["priority"] = {"id": mapped.priority_id}
 
     if mapped.original_estimate:
         fields["timetracking"] = {"originalEstimate": mapped.original_estimate}
@@ -299,9 +321,27 @@ def build_create_payload(mapped: TaskMappingResult) -> dict:
     return {"fields": fields}
 
 
+def build_update_fields(*, field_ids: dict[str, str]) -> dict:
+    """
+    Set the two required fields after create.
+    For select fields Jira expects {"value": "..."}.
+    """
+    return {
+        field_ids["Oppgavekategori"]: {"value": CONST_OPPGAVEKATEGORI},
+        field_ids["Category of work"]: {"value": CONST_CATEGORY_OF_WORK},
+    }
+
+
+# ----------------------------
+# Migration
+# ----------------------------
 def migrate_tasks(tasks: list[dict], *, dry_run: bool = False) -> list[str]:
     jira_priorities = get_priorities()
     mapper = TaskMapper()
+
+    # Resolve custom field IDs once
+    field_ids = resolve_field_ids(["Oppgavekategori", "Category of work"])
+    print("Resolved field ids:", field_ids)
 
     created_keys: list[str] = []
 
@@ -314,49 +354,51 @@ def migrate_tasks(tasks: list[dict], *, dry_run: bool = False) -> list[str]:
 
         print(f"\n[{i}/{len(tasks)}] {mapped.summary}")
         print(f"  labels={mapped.labels}")
-        print(
-            f"  priority={mapped.priority_name} estimate={mapped.original_estimate}")
+        print(f"  priority={mapped.priority_id} estimate={mapped.original_estimate}")
         print(f"  target_status_id={mapped.target_status_id} comments={len(mapped.comments)}")
 
         if dry_run:
             continue
 
-        # 1) Create
+        # 1) Create (WITHOUT the custom fields)
         payload = build_create_payload(mapped)
         issue = create_issue(payload)
         key = issue["key"]
         created_keys.append(key)
         print(f"  created={key}")
 
+        # 1b) Update custom fields after creation
+        try:
+            update_fields = build_update_fields(field_ids=field_ids)
+            set_issue_fields(key, update_fields)
+            print("  custom_fields_set=yes")
+        except Exception as e:
+            # Don't hard-fail migration if fields can't be set (screen/context issue)
+            print(f"  WARN: could not set custom fields: {e}")
+
         # 2) Move to board (UI: Flytt arbeidsoppgave -> Tavle)
-        # Put it near the top if we have an anchor
         move_issue_to_board(key, rank_before=anchor_key)
         print("  moved_to_board=yes")
 
         # 3) Transition status (if needed and not already)
-        # NOTE: move-to-board may already set/keep status; this is workflow-dependent.
         if mapped.target_status_id and mapped.target_status_id != STATUS_ID_BACKLOG:
             try:
                 transition_to_status_id(key, mapped.target_status_id)
                 print(f"  transitioned_to_status_id={mapped.target_status_id}")
             except Exception as e:
-                # Don’t hard-fail the whole migration if a transition is blocked
                 print(f"  WARN: transition failed: {e}")
 
         # 4) Add comments
         for c in mapped.comments:
             add_comment(key, c)
-            # gentle pacing to avoid rate limits on large migrations
             time.sleep(0.1)
 
-        # 5) (Optional) store original metadata as a comment for traceability
+        # 5) Optional migration metadata (NO codebase here anymore)
         meta_lines = []
         if task.get("Ferdigstilt"):
             meta_lines.append(f"Original Ferdigstilt: {task['Ferdigstilt']}")
         if task.get("Arkiveringsdato"):
             meta_lines.append(f"Original Arkiveringsdato: {task['Arkiveringsdato']}")
-        if task.get("Kodebase / type"):
-            meta_lines.append(f"Original Kodebase/type: {task['Kodebase / type']}")
         if meta_lines:
             add_comment(key, "Migration metadata:\n" + "\n".join(meta_lines))
 
@@ -368,5 +410,5 @@ if __name__ == "__main__":
     with open("tasks_notion_small.json", "r", encoding="utf-8") as f:
         tasks = json.load(f)
 
-    created = migrate_tasks(tasks, dry_run=False)  # set dry_run=False when ready
+    created = migrate_tasks(tasks, dry_run=False)  # set dry_run=True to test
     print("\nCreated:", created)
