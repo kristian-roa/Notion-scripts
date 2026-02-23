@@ -1,0 +1,15 @@
+[
+  {
+    "Title": "Feedback EM1 NN",
+    "Status": "Archived",
+    "Prioritet": "P: Høy",
+    "Estimater": "S: Liten (4t)",
+    "Tilordnet": "Felix Forseth",
+    "Tags": "prompting, enhancement",
+    "Ferdigstilt": "2025-03-14",
+    "Arkiveringsdato": "2025-03-28",
+    "Kodebase / type": "ai",
+    "Description": "Se beskrivelse etter test på kundekortet til EM1 NN: Eiendomsmegler 1 Nord Norge\nOppgaver:\n[x] Justere preferanser\n  [x] Standard\n    [x] Inkludert produksjon av tilstandsgrader\n  [x] Byggemåte\n  [x] Regulering\n[x] Tone ned skryt ved TG3\n[ ] Migrere produksjon av Radon fra Next\n[ ] Migrere produksjon av Parkering fra Next",
+    "Comments": "2025-04-01T10:48:00.000Z: https://github.com/wojtekmaj/react-pdf/issues/963\n2025-07-10T12:07:00.000Z: Ser kanskje ut som at dette blir fikset med ny prop `annotationMode`, men den er ikke publisert i react-pdf enda\n2025-08-20T07:31:00.000Z: https://github.com/wojtekmaj/react-pdf/pull/1998"
+  }
+]
